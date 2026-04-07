@@ -12,6 +12,9 @@
     <a href="#-use-cases">Use Cases</a> •
     <a href="#-uninstall">Uninstall</a>
   </p>
+  <p align="center">
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-BSD%203--Clause-blue.svg" alt="License: BSD 3-Clause"/></a>
+  </p>
 </p>
 
 ---
@@ -325,7 +328,7 @@ Contributions, issues, and feature requests are welcome! Feel free to open an is
 
 ## 📄 License
 
-This project is open source. See the repository for license details.
+This project is licensed under the [BSD 3-Clause License](LICENSE).
 
 ---
 
