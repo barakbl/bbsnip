@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# =============================================================================
+# bbsnip installer
+# Usage: curl -fsSL https://raw.githubusercontent.com/barakbl/bbsnip/main/install | bash
+# =============================================================================
+
+set -euo pipefail
+
+REPO="barakbl/bbsnip"
+BRANCH="main"
+RAW="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
+
+INSTALL_DIR="${BBSNIP_INSTALL_DIR:-$HOME/.local/bin}"
+PLUGIN_DIR="${BBSNIP_PLUGIN_DIR:-$HOME/.config/bbsnip}"
+
+# --- colors ----------------------------------------------------------------
+bold=$'\e[1m' dim=$'\e[2m' reset=$'\e[0m'
+green=$'\e[32m' red=$'\e[31m' cyan=$'\e[36m' yellow=$'\e[33m'
+
+info()  { printf '%s[bbsnip]%s %s\n' "$cyan"   "$reset" "$1"; }
+ok()    { printf '%s[bbsnip]%s %s\n' "$green"  "$reset" "$1"; }
+warn()  { printf '%s[bbsnip]%s %s\n' "$yellow" "$reset" "$1"; }
+fail()  { printf '%s[bbsnip]%s %s\n' "$red"    "$reset" "$1"; exit 1; }
+
+# --- pre-flight checks -----------------------------------------------------
+info "Checking dependencies..."
+
+command -v curl &>/dev/null || fail "curl is required but not found."
+command -v zsh  &>/dev/null || fail "zsh is required but not found."
+
+if ! command -v jq &>/dev/null; then
+  warn "jq not found — bbsnip requires jq to run."
+  warn "Install it: ${bold}brew install jq${reset}"
+fi
+
+if ! command -v fzf &>/dev/null; then
+  warn "fzf not found — fuzzy search features require fzf."
+  warn "Install it: ${bold}brew install fzf${reset}"
+fi
+
+# --- download ---------------------------------------------------------------
+info "Installing bbsnip to ${bold}${INSTALL_DIR}${reset}"
+
+mkdir -p "$INSTALL_DIR"
+mkdir -p "$PLUGIN_DIR"
+
+curl -fsSL "${RAW}/bbsnip" -o "${INSTALL_DIR}/bbsnip"
+chmod +x "${INSTALL_DIR}/bbsnip"
+ok "Installed ${bold}bbsnip${reset} -> ${INSTALL_DIR}/bbsnip"
+
+curl -fsSL "${RAW}/bbsnip.plugin.zsh" -o "${PLUGIN_DIR}/bbsnip.plugin.zsh"
+ok "Installed ${bold}plugin${reset}  -> ${PLUGIN_DIR}/bbsnip.plugin.zsh"
+
+# --- PATH check ------------------------------------------------------------
+if [[ ":$PATH:" != *":${INSTALL_DIR}:"* ]]; then
+  warn "${INSTALL_DIR} is not in your PATH."
+  warn "Add this to your ${bold}~/.zshrc${reset}:"
+  printf '\n  %sexport PATH="%s:$PATH"%s\n\n' "$dim" "$INSTALL_DIR" "$reset"
+fi
+
+# --- shell integration ------------------------------------------------------
+ZSHRC="${ZDOTDIR:-$HOME}/.zshrc"
+PLUGIN_SOURCE="source \"${PLUGIN_DIR}/bbsnip.plugin.zsh\""
+
+if [[ -f "$ZSHRC" ]] && grep -qF "bbsnip.plugin.zsh" "$ZSHRC" 2>/dev/null; then
+  ok "zsh plugin already sourced in ${bold}~/.zshrc${reset}"
+else
+  printf '\n# bbsnip tab completion\n%s\n' "$PLUGIN_SOURCE" >> "$ZSHRC"
+  ok "Added plugin source to ${bold}~/.zshrc${reset}"
+fi
+
+# --- done -------------------------------------------------------------------
+printf '\n'
+printf '%s  ╔══════════════════════════════════════╗%s\n' "$green" "$reset"
+printf '%s  ║  %sbbsnip installed successfully! 🎉%s%s   ║%s\n' "$green" "$bold" "$reset" "$green" "$reset"
+printf '%s  ╚══════════════════════════════════════╝%s\n' "$green" "$reset"
+printf '\n'
+info "Run ${bold}source ~/.zshrc${reset} or open a new terminal to get started."
+info "Then try: ${bold}bbsnip help${reset}"
+printf '\n'

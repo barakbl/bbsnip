@@ -1,0 +1,998 @@
+#!/usr/bin/env zsh
+# =============================================================================
+# bbsnip - Alfred Snippets CLI
+# Access Alfred app snippets from the terminal with fuzzy search,
+# clipboard, and stdout support.
+#
+# Dependencies: jq, fzf
+# =============================================================================
+
+: ${ALFRED_SNIPPETS_DIR:="$HOME/Library/Application Support/Alfred/Alfred.alfredpreferences/snippets"}
+: ${BBSNIP_SNIPPETS_DIR:="$HOME/.config/bbsnip/snippets"}
+: ${BBSNIP_HIST_MAX:=200}
+
+BBSNIP_HIST_DIR="$HOME/.config/bbsnip"
+BBSNIP_HIST_FILE="$BBSNIP_HIST_DIR/history"
+
+_bbsnip_ensure_snippets_dir() {
+  [[ -d "$BBSNIP_SNIPPETS_DIR" ]] || mkdir -p "$BBSNIP_SNIPPETS_DIR"
+}
+
+_bbsnip_has_alfred() {
+  [[ -d "$ALFRED_SNIPPETS_DIR" ]]
+}
+
+_bbsnip_hist_init() {
+  [[ -d "$BBSNIP_HIST_DIR" ]] || mkdir -p "$BBSNIP_HIST_DIR"
+  [[ -f "$BBSNIP_HIST_FILE" ]] || touch "$BBSNIP_HIST_FILE"
+}
+
+_bbsnip_hist_save() {
+  local entry="$1"
+  [[ -z "$entry" ]] && return
+  _bbsnip_hist_init
+
+  # append and trim to BBSNIP_HIST_MAX
+  printf '%s\n' "$entry" >> "$BBSNIP_HIST_FILE"
+  local count=$(wc -l < "$BBSNIP_HIST_FILE")
+  if (( count > BBSNIP_HIST_MAX )); then
+    local excess=$(( count - BBSNIP_HIST_MAX ))
+    tail -n +"$(( excess + 1 ))" "$BBSNIP_HIST_FILE" > "$BBSNIP_HIST_FILE.tmp" \
+      && mv "$BBSNIP_HIST_FILE.tmp" "$BBSNIP_HIST_FILE"
+  fi
+}
+
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
+_bbsnip_files() {
+  local collection="$1"
+  local found=false
+  for base in "$ALFRED_SNIPPETS_DIR" "$BBSNIP_SNIPPETS_DIR"; do
+    local dir="$base"
+    [[ -n "$collection" ]] && dir="$dir/$collection"
+    [[ -d "$dir" ]] || continue
+    found=true
+    find "$dir" -name '*.json' ! -name 'info.plist' 2>/dev/null
+  done | sort
+  $found || return 1
+}
+
+_bbsnip_keywords() {
+  _bbsnip_files "$1" | while IFS= read -r f; do
+    jq -r '.alfredsnippet.keyword // empty' "$f" 2>/dev/null
+  done | sort -u
+}
+
+_bbsnip_collections() {
+  local found=false
+  for base in "$ALFRED_SNIPPETS_DIR" "$BBSNIP_SNIPPETS_DIR"; do
+    [[ -d "$base" ]] || continue
+    found=true
+    for d in "$base"/*(N/); do
+      basename "$d"
+    done
+  done | sort -u
+  $found || return 1
+}
+
+_bbsnip_resolve() {
+  local keyword="$1" collection="$2"
+  _bbsnip_files "$collection" | while IFS= read -r f; do
+    if [[ "$(jq -r '.alfredsnippet.keyword // empty' "$f" 2>/dev/null)" == "$keyword" ]]; then
+      printf '%s' "$f"
+      return 0
+    fi
+  done
+  return 1
+}
+
+_bbsnip_content() {
+  jq -r '.alfredsnippet.snippet // empty' "$1" 2>/dev/null
+}
+
+# -----------------------------------------------------------------------------
+# Placeholder expansion (Alfred dynamic placeholders)
+# Supports: {clipboard}, {date}, {time}, {datetime}, {isodate}, {isotime},
+#   {isodatetime}, {random:...}, {query}, {snippet:kw}, date arithmetic,
+#   and modifiers: .uppercase .lowercase .capitals .trim .reverse
+#                  .stripdiacritics .stripnonalphanumeric
+# -----------------------------------------------------------------------------
+
+BBSNIP_EXPAND_LOG=$(mktemp /tmp/bbsnip_log.XXXXXX)
+
+_bbsnip_expand() {
+  local text="$1" result="" _bbsnip_query_cache=""
+  : > "$BBSNIP_EXPAND_LOG"
+
+  while [[ -n "$text" ]]; do
+    # match {options: [...]} with nested brackets first, then simple {placeholder}
+    if [[ "$text" =~ '^([^{]*)\{(options:[[:space:]]*\[[^]]*\])\}' ]]; then
+      result+="${match[1]}"
+      local inner="${match[2]}"
+      local matched="{${inner}}"
+      text="${text#*"$matched"}"
+      result+="$(_bbsnip_resolve_placeholder "$inner")"
+    elif [[ "$text" =~ '^([^{]*)\{([^}]+)\}' ]]; then
+      result+="${match[1]}"
+      local inner="${match[2]}"
+      local matched="{${inner}}"
+      text="${text#*"$matched"}"
+      result+="$(_bbsnip_resolve_placeholder "$inner")"
+    else
+      result+="$text"
+      break
+    fi
+  done
+
+  printf '%s' "$result"
+}
+
+_bbsnip_resolve_placeholder() {
+  local spec="$1"
+  local _red=$'\e[31m' _yellow=$'\e[33m' _reset=$'\e[0m'
+
+  # --- handle {shell.VARNAME} early (before modifier stripping) ---
+  if [[ "$spec" == shell.* ]]; then
+    local varname="${spec#shell.}"
+    local value="${(P)varname}"
+    [[ -z "$value" ]] && value="{shell.${varname}}"
+    printf '🔧\tshell.%s\t%s\n' "$varname" "$value" >> "$BBSNIP_EXPAND_LOG"
+    printf '%s' "${_red}${value}${_reset}"
+    return
+  fi
+
+  # --- extract modifiers from end ---
+  local -a modifiers
+  local known=(uppercase lowercase capitals capitalcase trim reverse stripdiacritics stripnonalphanumeric)
+  while true; do
+    local found=false
+    for m in "${known[@]}"; do
+      if [[ "$spec" == *".$m" ]]; then
+        modifiers=("$m" "${modifiers[@]}")
+        spec="${spec%.$m}"
+        found=true; break
+      fi
+    done
+    $found || break
+  done
+
+  # --- extract base keyword ---
+  local base="${spec%%[: +\-]*}"
+  local rest="${spec#$base}"
+
+  # --- resolve value and pick glyph ---
+  local value color="" glyph=""
+  case "$base" in
+    options)    value=$(_bbsnip_resolve_options "$rest"); color="$_yellow"; glyph="📝" ;;
+    stdin)      value=$(_bbsnip_resolve_stdin "$rest"); color="$_red"; glyph="📥" ;;
+    shell)      value=$(_bbsnip_resolve_shell_cmd "$rest"); color="$_red"; glyph="⚡" ;;
+    query)      value=$(_bbsnip_prompt_query); color="$_red"; glyph="❓" ;;
+    clipboard)  value=$(_bbsnip_resolve_clipboard "$rest"); color="$_yellow"; glyph="📋" ;;
+    date|time|datetime|isodate|isotime|isodatetime)
+                value=$(_bbsnip_resolve_datetime "$base" "$rest"); color="$_yellow"; glyph="📅" ;;
+    random)     value=$(_bbsnip_resolve_random "$rest"); color="$_yellow"; glyph="🎲" ;;
+    snippet)    local kw="${rest#:}"
+                local f=$(_bbsnip_resolve "$kw")
+                value=$([[ -n "$f" ]] && _bbsnip_content "$f" || printf '{snippet:%s}' "$kw")
+                color="$_yellow"; glyph="🔗" ;;
+    cursor)     value="" ;;
+    *)          printf '{%s}' "$1"; return ;;
+  esac
+
+  # --- apply modifiers ---
+  for m in "${modifiers[@]}"; do
+    value=$(_bbsnip_apply_modifier "$value" "$m")
+  done
+
+  # --- log expansion ---
+  if [[ -n "$glyph" && -n "$value" ]]; then
+    local log_spec="${base}${rest}"
+    (( ${#modifiers[@]} > 0 )) && log_spec+=".${(j:.:)modifiers}"
+    printf '%s\t%s\t%s\n' "$glyph" "$log_spec" "$value" >> "$BBSNIP_EXPAND_LOG"
+  fi
+
+  if [[ -n "$color" && -n "$value" ]]; then
+    printf '%s' "${color}${value}${_reset}"
+  else
+    printf '%s' "$value"
+  fi
+}
+
+_bbsnip_prompt_query() {
+  # reuse cached value for repeated {query} in same snippet
+  if [[ -n "$_bbsnip_query_cache" ]]; then
+    printf '%s' "$_bbsnip_query_cache"
+    return
+  fi
+  local val
+  # if stdin was piped, use it as the query value
+  if $BBSNIP_STDIN_LOADED && [[ -n "$BBSNIP_STDIN" ]]; then
+    val="$BBSNIP_STDIN"
+  else
+    printf '\nSnippet requires input ({query}):\n  1) Type manually\n  2) Paste from clipboard\nChoice [1/2]: ' >/dev/tty
+    local choice
+    read -r choice </dev/tty
+    case "$choice" in
+      2) val=$(pbpaste) ;;
+      *) printf 'Value: ' >/dev/tty; read -r val </dev/tty ;;
+    esac
+  fi
+  _bbsnip_query_cache="$val"
+  printf '%s' "$val"
+}
+
+_bbsnip_resolve_options() {
+  local raw="${1#:}"
+  raw="${raw#"${raw%%[^[:space:]]*}"}"  # trim leading whitespace
+
+  # parse ["a","b","c"] — strip brackets, split on comma, trim quotes
+  raw="${raw#\[}"
+  raw="${raw%\]}"
+
+  local -a items=()
+  local item
+  while [[ -n "$raw" ]]; do
+    item="${raw%%,*}"
+    # trim whitespace and quotes
+    item="${item#"${item%%[^[:space:]]*}"}"
+    item="${item%"${item##*[^[:space:]]}"}"
+    item="${item#\"}"
+    item="${item%\"}"
+    item="${item#\'}"
+    item="${item%\'}"
+    items+=("$item")
+    [[ "$raw" == *,* ]] && raw="${raw#*,}" || break
+  done
+
+  (( ${#items[@]} == 0 )) && { printf '{options: %s}' "$1"; return; }
+
+  local _dim=$'\e[2m' _bold=$'\e[1m' _cyan=$'\e[36m' _reset=$'\e[0m'
+  printf '\n%s  select an option:%s\n' "$_dim" "$_reset" >/dev/tty
+  local i
+  for i in {1..${#items[@]}}; do
+    printf '  %s%d)%s %s\n' "$_cyan" "$i" "$_reset" "${items[$i]}" >/dev/tty
+  done
+  printf '%s  [1-%d] > %s' "$_cyan" "${#items[@]}" "$_reset" >/dev/tty
+  local choice
+  read -r choice </dev/tty
+
+  if (( choice >= 1 && choice <= ${#items[@]} )); then
+    printf '%s' "${items[$choice]}"
+  else
+    printf '%s' "${items[1]}"
+  fi
+}
+
+_bbsnip_resolve_shell_cmd() {
+  local cmd="${1#:}"
+  cmd="${cmd#"${cmd%%[^[:space:]]*}"}"  # trim leading whitespace
+
+  local _dim=$'\e[2m' _bold=$'\e[1m' _red=$'\e[31m' _green=$'\e[32m' _reset=$'\e[0m'
+  printf '\n%s  shell>%s %s%s%s\n' "$_dim" "$reset" "$_bold" "$cmd" "$_reset" >/dev/tty
+  printf '  %srun? [y/N]%s ' "$_red" "$_reset" >/dev/tty
+  local confirm
+  read -r confirm </dev/tty
+  case "$confirm" in
+    y|Y|yes|YES)
+      local output
+      output=$(eval "$cmd" 2>&1)
+      printf '  %s->%s %s\n' "$_green" "$_reset" "${output%%$'\n'*}" >/dev/tty
+      printf '%s' "$output"
+      ;;
+    *)
+      printf '  %sskipped%s\n' "$_dim" "$_reset" >/dev/tty
+      printf '{shell: %s}' "$cmd"
+      ;;
+  esac
+}
+
+_bbsnip_resolve_stdin() {
+  local jqpath="${1#:}"
+  jqpath="${jqpath#"${jqpath%%[^[:space:]]*}"}"  # trim leading whitespace
+
+  local _dim=$'\e[2m' _yellow=$'\e[33m' _reset=$'\e[0m'
+
+  # if no stdin was piped, prompt for JSON interactively
+  if ! $BBSNIP_STDIN_LOADED || [[ -z "$BBSNIP_STDIN" ]]; then
+    printf '\n%s  warning: no JSON on stdin%s\n' "$_yellow" "$_reset" >/dev/tty
+    printf '  paste JSON (end with a line containing only %s.%s):\n' "\e[1m" "$_reset" >/dev/tty
+    printf '%s  | %s' "$_dim" "$_reset" >/dev/tty
+    local line="" json_buf=""
+    while IFS= read -r line </dev/tty; do
+      [[ "$line" == "." ]] && break
+      [[ -n "$json_buf" ]] && json_buf+=$'\n'
+      json_buf+="$line"
+      printf '%s  | %s' "$_dim" "$_reset" >/dev/tty
+    done
+    if [[ -z "$json_buf" ]]; then
+      printf '{stdin: %s}' "$jqpath"
+      return
+    fi
+    BBSNIP_STDIN="$json_buf"
+    BBSNIP_STDIN_LOADED=true
+  fi
+
+  # validate JSON
+  if ! printf '%s' "$BBSNIP_STDIN" | jq empty 2>/dev/null; then
+    printf '%s  error: invalid JSON on stdin%s\n' "\e[31m" "$_reset" >&2
+    printf '{stdin: %s}' "$jqpath"
+    return
+  fi
+
+  local result
+  result=$(printf '%s' "$BBSNIP_STDIN" | jq -r "$jqpath" 2>/dev/null)
+
+  if [[ $? -ne 0 || "$result" == "null" ]]; then
+    printf '{stdin: %s}' "$jqpath"
+    return
+  fi
+
+  printf '%s' "$result"
+}
+
+_bbsnip_resolve_clipboard() {
+  local rest="$1" idx=0
+  [[ "$rest" =~ ':([0-9]+)' ]] && idx="${match[1]}"
+  (( idx > 0 )) && echo "  (clipboard history unavailable in terminal, using current)" >&2
+  pbpaste
+}
+
+_bbsnip_resolve_datetime() {
+  local type="$1" rest="$2"
+
+  # split at colon: arithmetic part | format part
+  local arith_part format_name
+  if [[ "$rest" == *:* ]]; then
+    arith_part="${rest%%:*}"
+    format_name="${rest#*:}"
+  else
+    arith_part="$rest"
+    format_name=""
+  fi
+
+  # build date -v flags from arithmetic (+7D, -3h, etc.)
+  local -a vflags
+  local ap="$arith_part"
+  while [[ "$ap" =~ '([+-][0-9]+)([YMDdhms])' ]]; do
+    local num="${match[1]}" unit="${match[2]}"
+    case "$unit" in
+      Y) vflags+=("-v${num}y") ;;
+      M) vflags+=("-v${num}m") ;;
+      D|d) vflags+=("-v${num}d") ;;
+      h) vflags+=("-v${num}H") ;;
+      m) vflags+=("-v${num}M") ;;
+      s) vflags+=("-v${num}S") ;;
+    esac
+    ap="${ap/${MATCH}/}"
+  done
+
+  # determine strftime format
+  local fmt
+  case "$type" in
+    isodate)     fmt="%Y-%m-%d" ;;
+    isotime)     fmt="%H:%M:%S" ;;
+    isodatetime) fmt="%Y-%m-%dT%H:%M:%S" ;;
+    date)
+      case "$format_name" in
+        short) fmt="%m/%d/%y" ;;
+        long)  fmt="%B %d, %Y" ;;
+        full)  fmt="%A, %B %d, %Y" ;;
+        *)     fmt="%b %d, %Y" ;;
+      esac ;;
+    time)
+      case "$format_name" in
+        short) fmt="%H:%M" ;;
+        long|full) fmt="%H:%M:%S %Z" ;;
+        *)     fmt="%H:%M:%S" ;;
+      esac ;;
+    datetime)
+      case "$format_name" in
+        short) fmt="%m/%d/%y %H:%M" ;;
+        long)  fmt="%B %d, %Y at %H:%M:%S %Z" ;;
+        full)  fmt="%A, %B %d, %Y at %H:%M:%S %Z" ;;
+        *)     fmt="%b %d, %Y %H:%M:%S" ;;
+      esac ;;
+  esac
+
+  date "${vflags[@]}" +"$fmt"
+}
+
+_bbsnip_resolve_random() {
+  local rest="${1#:}"
+  if [[ "$rest" == "UUID" ]]; then
+    uuidgen | tr '[:upper:]' '[:lower:]'
+  elif [[ "$rest" =~ '^([0-9]+)\.\.([0-9]+)$' ]]; then
+    echo $(( match[1] + RANDOM % (match[2] - match[1] + 1) ))
+  elif [[ -n "$rest" ]]; then
+    local -a items=("${(@s:,:)rest}")
+    printf '%s' "${items[$(( RANDOM % ${#items[@]} + 1 ))]}"
+  fi
+}
+
+_bbsnip_strip_ansi() {
+  printf '%s' "$1" | sed $'s/\e\\[[0-9;]*m//g'
+}
+
+# Output helper: respects --clipboard-only, prints expansion info
+_bbsnip_output() {
+  local content="$1"
+  local clean=$(_bbsnip_strip_ansi "$content")
+
+  local dim=$'\e[2m' bold=$'\e[1m' cyan=$'\e[36m' green=$'\e[32m'
+  local magenta=$'\e[35m' reset=$'\e[0m' ul=$'\e[4m'
+
+  # --- print expansion log if any placeholders were resolved ---
+  if [[ -s "$BBSNIP_EXPAND_LOG" ]]; then
+    {
+      printf '\n'
+      printf '%s%s 🧩 Expansions%s\n' "$cyan" "$bold" "$reset"
+      printf '%s ──────────────────────────────────────────%s\n' "$cyan" "$reset"
+      while IFS=$'\t' read -r glyph placeholder value; do
+        local display_val="$value"
+        (( ${#display_val} > 30 )) && display_val="${display_val:0:27}..."
+        printf '  %s  %s{%s}%s → %s"%s"%s\n' \
+          "$glyph" \
+          "$dim" "$placeholder" "$reset" \
+          "$green" "$display_val" "$reset"
+      done < "$BBSNIP_EXPAND_LOG"
+      printf '%s ──────────────────────────────────────────%s\n' "$cyan" "$reset"
+      printf '\n'
+      printf '%s%s 📜 Output %s%s(📋 Copied to clipboard)%s\n' "$magenta" "$bold" "$reset" "$dim" "$reset"
+      printf '%s ──────────────────────────────────────────%s\n\n' "$magenta" "$reset"
+    } >&2
+  fi
+
+  printf '%s' "$clean" | pbcopy
+  if ! $BBSNIP_CLIPBOARD_ONLY; then
+    printf '%s\n' "$content"
+  fi
+
+  # cleanup
+  [[ -f "$BBSNIP_EXPAND_LOG" ]] && rm -f "$BBSNIP_EXPAND_LOG"
+}
+
+_bbsnip_apply_modifier() {
+  local v="$1" m="$2"
+  case "$m" in
+    uppercase)            printf '%s' "${(U)v}" ;;
+    lowercase)            printf '%s' "${(L)v}" ;;
+    capitals|capitalcase) printf '%s' "${(C)v}" ;;
+    trim)                 v="${v#"${v%%[^[:space:]]*}"}"; printf '%s' "${v%"${v##*[^[:space:]]}"}" ;;
+    reverse)              printf '%s' "$(printf '%s' "$v" | rev)" ;;
+    stripdiacritics)      printf '%s' "$(printf '%s' "$v" | iconv -f UTF-8 -t ASCII//TRANSLIT 2>/dev/null || printf '%s' "$v")" ;;
+    stripnonalphanumeric) printf '%s' "$(printf '%s' "$v" | tr -cd '[:alnum:][:space:]\n')" ;;
+    *)                    printf '%s' "$v" ;;
+  esac
+}
+
+# -----------------------------------------------------------------------------
+# Commands
+# -----------------------------------------------------------------------------
+
+cmd_search() {
+  local collection=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) cmd_help; return 0 ;;
+      -c) collection="$2"; shift 2 ;;
+      *)  shift ;;
+    esac
+  done
+
+  command -v fzf &>/dev/null || { echo "fzf required: brew install fzf" >&2; return 1; }
+
+  local entries
+  entries=$(_bbsnip_files "$collection" | while IFS= read -r f; do
+    printf '%s\t%s\t%s\t%s\n' \
+      "$f" \
+      "$(jq -r '.alfredsnippet.keyword // empty' "$f" 2>/dev/null)" \
+      "$(jq -r '.alfredsnippet.name // empty' "$f" 2>/dev/null)" \
+      "$(basename "$(dirname "$f")")"
+  done)
+
+  [[ -z "$entries" ]] && { echo "No snippets found." >&2; return 1; }
+
+  local result
+  result=$(printf '%s' "$entries" | fzf \
+    --delimiter=$'\t' \
+    --with-nth='2..4' \
+    --header='enter=stdout | ctrl-y=clipboard' \
+    --preview='jq -r ".alfredsnippet.snippet" {1}' \
+    --preview-window='down:50%:wrap' \
+    --expect='ctrl-y' \
+    --no-multi)
+
+  [[ -z "$result" ]] && return 0
+
+  local key file content
+  key=$(head -1 <<< "$result")
+  file=$(sed -n '2p' <<< "$result" | cut -f1)
+
+  [[ -z "$file" || ! -f "$file" ]] && return 0
+
+  content=$(_bbsnip_expand "$(_bbsnip_content "$file")")
+
+  case "$key" in
+    ctrl-y) printf '%s' "$(_bbsnip_strip_ansi "$content")" | pbcopy; echo "Copied to clipboard." ;;
+    *)      _bbsnip_output "$content" ;;
+  esac
+}
+
+cmd_list() {
+  local collection=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) cmd_help; return 0 ;;
+      -c) collection="$2"; shift 2 ;;
+      *)  shift ;;
+    esac
+  done
+
+  printf '\e[1m%-30s %-30s %s\e[0m\n' "KEYWORD" "NAME" "COLLECTION"
+  printf '%-30s %-30s %s\n' "-------" "----" "----------"
+
+  _bbsnip_files "$collection" | while IFS= read -r f; do
+    printf '%-30s %-30s %s\n' \
+      "$(jq -r '.alfredsnippet.keyword // empty' "$f" 2>/dev/null)" \
+      "$(jq -r '.alfredsnippet.name // empty' "$f" 2>/dev/null)" \
+      "$(basename "$(dirname "$f")")"
+  done
+}
+
+cmd_show() {
+  local collection="" keyword=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) cmd_help; return 0 ;;
+      -c) collection="$2"; shift 2 ;;
+      *)  keyword="$1"; shift ;;
+    esac
+  done
+
+  [[ -z "$keyword" ]] && { echo "Usage: bbsnip show [-c collection] <keyword>" >&2; return 1; }
+
+  local file
+  file=$(_bbsnip_resolve "$keyword" "$collection")
+  [[ -z "$file" ]] && { echo "Snippet '$keyword' not found." >&2; return 1; }
+
+  _bbsnip_output "$(_bbsnip_expand "$(_bbsnip_content "$file")")"
+}
+
+cmd_copy() {
+  local collection="" keyword=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) cmd_help; return 0 ;;
+      -c) collection="$2"; shift 2 ;;
+      *)  keyword="$1"; shift ;;
+    esac
+  done
+
+  [[ -z "$keyword" ]] && { echo "Usage: bbsnip copy [-c collection] <keyword>" >&2; return 1; }
+
+  local file
+  file=$(_bbsnip_resolve "$keyword" "$collection")
+  [[ -z "$file" ]] && { echo "Snippet '$keyword' not found." >&2; return 1; }
+
+  local content
+  content=$(_bbsnip_expand "$(_bbsnip_content "$file")")
+  printf '%s' "$(_bbsnip_strip_ansi "$content")" | pbcopy
+  echo "Copied '$keyword' to clipboard."
+}
+
+cmd_paste() {
+  local collection="" keyword=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) cmd_help; return 0 ;;
+      -c) collection="$2"; shift 2 ;;
+      *)  keyword="$1"; shift ;;
+    esac
+  done
+
+  [[ -z "$keyword" ]] && { echo "Usage: bbsnip paste [-c collection] <keyword>" >&2; return 1; }
+
+  local file
+  file=$(_bbsnip_resolve "$keyword" "$collection")
+  [[ -z "$file" ]] && { echo "Snippet '$keyword' not found." >&2; return 1; }
+
+  local content
+  content=$(_bbsnip_expand "$(_bbsnip_content "$file")")
+
+  # Copy to clipboard (clean) and print to stdout (colored)
+  printf '%s' "$(_bbsnip_strip_ansi "$content")" | pbcopy
+  if ! $BBSNIP_CLIPBOARD_ONLY; then
+    printf '%s\n' "$content"
+  fi
+  echo "Copied to clipboard." >&2
+}
+
+cmd_export() {
+  local collection=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) cmd_help; return 0 ;;
+      -c) collection="$2"; shift 2 ;;
+      *)  shift ;;
+    esac
+  done
+
+  _bbsnip_files "$collection" | while IFS= read -r f; do
+    jq --arg col "$(basename "$(dirname "$f")")" '{
+      keyword: .alfredsnippet.keyword,
+      name: .alfredsnippet.name,
+      snippet: .alfredsnippet.snippet,
+      uid: .alfredsnippet.uid,
+      collection: $col
+    }' "$f" 2>/dev/null
+  done | jq -s '.'
+}
+
+cmd_new() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) cmd_help; return 0 ;;
+      *)  shift ;;
+    esac
+  done
+
+  local dim=$'\e[2m' bold=$'\e[1m' cyan=$'\e[36m' green=$'\e[32m'
+  local yellow=$'\e[33m' magenta=$'\e[35m' reset=$'\e[0m' red=$'\e[31m'
+
+  printf '\n'
+  printf '%s' "${cyan}"
+  printf '  +------------------------------+\n'
+  printf '  |  %sbbsnip%s%s :: new snippet       |\n' "$bold" "$reset$cyan" "$cyan"
+  printf '  +------------------------------+\n'
+  printf '%s\n' "$reset"
+
+  _bbsnip_ensure_snippets_dir
+
+  # --- vault selection ---
+  local vault_dir=""
+  if _bbsnip_has_alfred; then
+    printf '%s[0/4]%s %sVault%s\n' "$dim" "$reset" "$bold" "$reset"
+    printf '  %s1)%s Alfred   %s(%s)%s\n' "$yellow" "$reset" "$dim" "$ALFRED_SNIPPETS_DIR" "$reset"
+    printf '  %s2)%s bbsnip   %s(%s)%s\n' "$yellow" "$reset" "$dim" "$BBSNIP_SNIPPETS_DIR" "$reset"
+    printf '%s  [1/2] > %s' "$cyan" "$reset"
+    local vault_choice=""
+    read -r vault_choice </dev/tty
+    case "$vault_choice" in
+      2) vault_dir="$BBSNIP_SNIPPETS_DIR" ;;
+      *) vault_dir="$ALFRED_SNIPPETS_DIR" ;;
+    esac
+    printf '\n'
+  else
+    vault_dir="$BBSNIP_SNIPPETS_DIR"
+  fi
+
+  # --- collection ---
+  printf '%s[1/4]%s %sCollection%s\n' "$dim" "$reset" "$bold" "$reset"
+
+  local -a cols
+  cols=($(_bbsnip_collections))
+  local collection=""
+
+  if (( ${#cols[@]} > 0 )); then
+    local fzf_result
+    fzf_result=$(printf '%s\n' "${cols[@]}" | fzf \
+      --height=~40% --reverse --no-multi \
+      --print-query \
+      --header=$'select existing or type new name\nesc to abort' \
+      --prompt='collection > ' \
+      --color='pointer:cyan,prompt:cyan')
+
+    local fzf_exit=$?
+    # esc pressed — fzf exits 130
+    if (( fzf_exit == 130 )); then
+      echo "${red}  aborted.${reset}" >&2; return 1
+    fi
+
+    local query selected
+    query=$(head -1 <<< "$fzf_result")
+    selected=$(sed -n '2p' <<< "$fzf_result")
+
+    # prefer the fzf selection; fall back to typed query for new collections
+    collection="${selected:-$query}"
+    [[ -z "$collection" ]] && { echo "${red}  aborted.${reset}" >&2; return 1; }
+  else
+    printf '  no collections yet -- enter a name to create one\n'
+    printf '%s  > %s' "$cyan" "$reset"
+    read -r collection </dev/tty
+    [[ -z "$collection" ]] && { echo "${red}  aborted.${reset}" >&2; return 1; }
+  fi
+
+  local col_dir="$vault_dir/$collection"
+  local is_new_col=false
+  if [[ ! -d "$col_dir" ]]; then
+    is_new_col=true
+    printf '  %s+ new collection:%s %s%s%s\n' "$dim" "$reset" "$green" "$collection" "$reset"
+  else
+    printf '  %s~ collection:%s %s%s%s\n' "$dim" "$reset" "$magenta" "$collection" "$reset"
+  fi
+  printf '\n'
+
+  # --- keyword ---
+  printf '%s[2/4]%s %sKeyword%s %s(trigger text, e.g. my_greeting)%s\n' "$dim" "$reset" "$bold" "$reset" "$dim" "$reset"
+  printf '%s  > %s' "$cyan" "$reset"
+  local keyword=""
+  read -r keyword </dev/tty
+  [[ -z "$keyword" ]] && { echo "${red}  aborted.${reset}" >&2; return 1; }
+
+  # check for duplicates
+  local existing
+  existing=$(_bbsnip_resolve "$keyword" "$collection" 2>/dev/null)
+  if [[ -n "$existing" ]]; then
+    printf '  %s!! keyword "%s" already exists in %s%s\n' "$red" "$keyword" "$collection" "$reset" >&2
+    return 1
+  fi
+  printf '\n'
+
+  # --- name ---
+  printf '%s[3/4]%s %sName%s %s(display label, enter to use "%s")%s\n' "$dim" "$reset" "$bold" "$reset" "$dim" "$keyword" "$reset"
+  printf '%s  > %s' "$cyan" "$reset"
+  local name=""
+  read -r name </dev/tty
+  [[ -z "$name" ]] && name="$keyword"
+  printf '\n'
+
+  # --- snippet content ---
+  printf '%s[4/4]%s %sSnippet content%s\n' "$dim" "$reset" "$bold" "$reset"
+  printf '  %s1)%s type single line\n' "$yellow" "$reset"
+  printf '  %s2)%s multiline (end with a line containing only %s.%s)\n' "$yellow" "$reset" "$bold" "$reset"
+  printf '  %s3)%s paste from clipboard\n' "$yellow" "$reset"
+  printf '  %s4)%s open in $EDITOR\n' "$yellow" "$reset"
+  printf '%s  [1/2/3/4] > %s' "$cyan" "$reset"
+  local mode=""
+  read -r mode </dev/tty
+
+  local snippet=""
+  case "$mode" in
+    2)
+      printf '  %s(type your snippet, end with a line containing only ".")%s\n' "$dim" "$reset"
+      printf '%s  | %s' "$cyan" "$reset"
+      local line=""
+      while IFS= read -r line </dev/tty; do
+        [[ "$line" == "." ]] && break
+        [[ -n "$snippet" ]] && snippet+=$'\n'
+        snippet+="$line"
+        printf '%s  | %s' "$cyan" "$reset"
+      done
+      ;;
+    3)
+      snippet=$(pbpaste)
+      if [[ -z "$snippet" ]]; then
+        printf '  %s!! clipboard is empty%s\n' "$red" "$reset" >&2
+        return 1
+      fi
+      printf '  %s(pasted %d chars from clipboard)%s\n' "$dim" "${#snippet}" "$reset"
+      ;;
+    4)
+      local tmpfile=$(mktemp /tmp/bbsnip.XXXXXX)
+      ${EDITOR:-vim} "$tmpfile" </dev/tty >/dev/tty
+      snippet=$(cat "$tmpfile")
+      rm -f "$tmpfile"
+      if [[ -z "$snippet" ]]; then
+        printf '  %s!! editor returned empty content%s\n' "$red" "$reset" >&2
+        return 1
+      fi
+      printf '  %s(read %d chars from editor)%s\n' "$dim" "${#snippet}" "$reset"
+      ;;
+    *)
+      printf '%s  > %s' "$cyan" "$reset"
+      read -r snippet </dev/tty
+      ;;
+  esac
+
+  [[ -z "$snippet" ]] && { printf '  %s!! empty snippet, aborted.%s\n' "$red" "$reset" >&2; return 1; }
+  printf '\n'
+
+  # --- preview ---
+  local uid=$(uuidgen | tr '[:upper:]' '[:lower:]')
+
+  printf '%s  +--- preview ----------------------+%s\n' "$dim" "$reset"
+  printf '  %scollection :%s %s\n' "$dim" "$reset" "$collection"
+  printf '  %skeyword    :%s %s\n' "$dim" "$reset" "$keyword"
+  printf '  %sname       :%s %s\n' "$dim" "$reset" "$name"
+  printf '  %suid        :%s %s\n' "$dim" "$reset" "$uid"
+  printf '  %scontent    :%s\n' "$dim" "$reset"
+  printf '%s' "$snippet" | while IFS= read -r line; do
+    printf '  %s|%s %s\n' "$dim" "$reset" "$line"
+  done
+  printf '%s  +----------------------------------+%s\n' "$dim" "$reset"
+  printf '\n'
+
+  # --- confirm ---
+  printf '  %ssave? [Y/n]%s ' "$bold" "$reset"
+  local confirm=""
+  read -r confirm </dev/tty
+  case "$confirm" in
+    n|N|no|NO) printf '  %sdiscarded.%s\n' "$dim" "$reset"; return 0 ;;
+  esac
+
+  # --- write ---
+  if $is_new_col; then
+    mkdir -p "$col_dir"
+  fi
+
+  local filename="${keyword} [${uid:u}].json"
+  local filepath="$col_dir/$filename"
+
+  # escape snippet for JSON: jq handles it safely
+  jq -n \
+    --arg snippet "$snippet" \
+    --arg uid "$uid" \
+    --arg name "$name" \
+    --arg keyword "$keyword" \
+    '{alfredsnippet: {snippet: $snippet, uid: $uid, name: $name, keyword: $keyword}}' \
+    > "$filepath"
+
+  printf '\n'
+  printf '  %s+%s %s%s%s -> %s\n' "$green" "$reset" "$bold" "$keyword" "$reset" "$filepath"
+  printf '  %sdone.%s\n\n' "$green" "$reset"
+}
+
+cmd_history() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) cmd_help; return 0 ;;
+      *)  shift ;;
+    esac
+  done
+
+  command -v fzf &>/dev/null || { echo "fzf required: brew install fzf" >&2; return 1; }
+  _bbsnip_hist_init
+
+  [[ -s "$BBSNIP_HIST_FILE" ]] || { echo "No history yet." >&2; return 1; }
+
+  # show most recent first
+  local selected
+  selected=$(tail -r "$BBSNIP_HIST_FILE" | awk '!seen[$0]++' | fzf \
+    --height=~50% --reverse --no-multi \
+    --header='select a command to re-run' \
+    --prompt='history > ' \
+    --preview='echo {}' \
+    --preview-window='down:3:wrap')
+
+  [[ -z "$selected" ]] && return 0
+
+  echo "re-running: $selected" >&2
+  eval "$selected"
+}
+
+cmd_collections() {
+  _bbsnip_collections
+}
+
+cmd_help() {
+  cat <<'EOF'
+bbsnip - access Alfred snippets from the terminal
+
+Usage: bbsnip [command] [options]
+
+Commands:
+  (default)     Fuzzy search with fzf
+  new           Create a new snippet (interactive)
+  list          List all snippets
+  show <kw>     Print snippet to stdout
+  copy <kw>     Copy snippet to clipboard
+  paste <kw>    Print snippet and copy to clipboard
+  export        Export all snippets as JSON
+  history       Browse and re-run past commands via fzf
+  collections   List available collections
+  help          Show this help
+
+Options:
+  --clipboard-only   Copy to clipboard only, no stdout output
+  -c <name>          Filter by collection
+
+fzf keybindings:
+  enter         Print to stdout
+  ctrl-y        Copy to clipboard
+
+Examples:
+  bbsnip                            fuzzy search all collections
+  bbsnip -c obsidian                fuzzy search one collection
+  bbsnip list                       list all snippets
+  bbsnip --clipboard-only show kw    copy snippet to clipboard only
+  bbsnip show obs_callout_tip       print snippet content
+  bbsnip copy obs_callout_tip       copy to clipboard
+  bbsnip paste obs_callout_tip      print and copy to clipboard
+  bbsnip export > snippets.json     export as JSON
+  bbsnip new                         create a new snippet
+  bbsnip export -c obsidian         export one collection
+
+Placeholders (expanded on show/copy/paste/search):
+  {options: [...]}   pick from a list (e.g. ["a","b","c"])         [yellow]
+  {stdin: jq_path}  extract from piped JSON via jq                [red]
+  {shell.VARNAME}   env variable (e.g. {shell.EDITOR} -> vim)    [red]
+  {shell: command}  run shell command (asks before executing)     [red]
+  {query}           interactive prompt                            [red]
+  {date}, {time}... date/time with arithmetic & format styles     [yellow]
+  {clipboard}       current clipboard                             [yellow]
+  {random:...}      UUID, range, or pick from list                [yellow]
+  {snippet:kw}      embed another snippet                         [yellow]
+
+  stdin examples:
+    echo '{"name":"barak"}' | bbsnip show my_tpl    {stdin: .name} -> barak
+    curl -s api/users/1 | bbsnip show tpl           {stdin: .user.email}
+    cat data.json | bbsnip show tpl                  {stdin: .items[0].id}
+    cat data.json | bbsnip show tpl                  {stdin: .tags | length}
+
+Config:
+  ALFRED_SNIPPETS_DIR   Alfred snippets directory (default: ~/Library/Application Support/Alfred/Alfred.alfredpreferences/snippets)
+  BBSNIP_SNIPPETS_DIR   bbsnip snippets directory (default: ~/.config/bbsnip/snippets)
+  BBSNIP_HIST_MAX       Max history entries (default: 200)
+
+Vaults:
+  Both Alfred and bbsnip snippet directories are searched together.
+  When creating a new snippet, you choose which vault to save to.
+
+History:
+  ~/.config/bbsnip/history    command history file (auto-created)
+EOF
+}
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+
+command -v jq &>/dev/null || { echo "jq required: brew install jq" >&2; exit 1; }
+
+# Buffer stdin if piped (consumed once, reused by {stdin:} placeholders)
+BBSNIP_STDIN=""
+BBSNIP_STDIN_LOADED=false
+if [[ ! -t 0 ]]; then
+  BBSNIP_STDIN=$(cat)
+  BBSNIP_STDIN_LOADED=true
+fi
+
+BBSNIP_CLIPBOARD_ONLY=false
+
+# parse global flags
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --clipboard-only) BBSNIP_CLIPBOARD_ONLY=true; shift ;;
+    *) break ;;
+  esac
+done
+
+cmd="${1:-search}"
+
+case "$cmd" in
+  -h|--help)
+    cmd="help"; shift ;;
+  new|search|list|show|copy|paste|export|history|collections|help)
+    shift ;;
+  -c)
+    cmd="search" ;;
+  *)
+    cmd="search" ;;
+esac
+
+# reconstruct the raw command for history (before execution)
+_bbsnip_raw_cmd="bbsnip"
+$BBSNIP_CLIPBOARD_ONLY && _bbsnip_raw_cmd+=" --clipboard-only"
+_bbsnip_raw_cmd+=" $cmd"
+(( $# > 0 )) && _bbsnip_raw_cmd+=" $*"
+
+case "$cmd" in
+  search)      cmd_search "$@" ;;
+  new)         cmd_new "$@" ;;
+  list)        cmd_list "$@" ;;
+  show)        cmd_show "$@" ;;
+  copy)        cmd_copy "$@" ;;
+  paste)       cmd_paste "$@" ;;
+  export)      cmd_export "$@" ;;
+  history)     cmd_history "$@" ;;
+  collections) cmd_collections ;;
+  help)        cmd_help ;;
+esac
+
+# save to history (skip help/history themselves)
+case "$cmd" in
+  help|history) ;;
+  *) _bbsnip_hist_save "$_bbsnip_raw_cmd" ;;
+esac
