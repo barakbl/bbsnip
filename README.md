@@ -132,8 +132,8 @@ bbsnip new
 
 | Key | Action |
 |-----|--------|
-| `Enter` | Print to stdout |
-| `Ctrl-Y` | Copy to clipboard |
+| `Enter` | Print to stdout + copy to clipboard |
+| `Ctrl-Y` | Copy to clipboard only (silent) |
 
 ---
 

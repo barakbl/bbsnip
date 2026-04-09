@@ -500,7 +500,7 @@ cmd_search() {
     --with-nth='2..4' \
     --header='enter=stdout | ctrl-y=clipboard' \
     --preview='jq -r ".alfredsnippet.snippet" {1}' \
-    --preview-window='down:50%:wrap' \
+    --preview-window='right:50%:wrap' \
     --expect='ctrl-y' \
     --no-multi)
 
